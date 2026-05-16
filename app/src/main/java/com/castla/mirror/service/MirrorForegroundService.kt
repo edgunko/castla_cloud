@@ -34,6 +34,7 @@ import com.castla.mirror.capture.VideoEncoder
 import com.castla.mirror.capture.VirtualDisplayManager
 import com.castla.mirror.input.TouchInjector
 import com.castla.mirror.server.MirrorServer
+import com.castla.mirror.shizuku.BinderConnectionTracker
 import com.castla.mirror.shizuku.IPrivilegedService
 import com.castla.mirror.shizuku.ShizukuSetup
 import com.castla.mirror.ott.BrowserResolver
@@ -63,9 +64,11 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 class MirrorForegroundService : Service() {
@@ -205,6 +208,20 @@ class MirrorForegroundService : Service() {
     @Volatile private var shizukuSetupInProgress = false
     private var shizukuBindRetryCount = 0
     private val SHIZUKU_MAX_RETRIES = 2
+    private val BIND_WAIT_BUDGET_MS = 8_000L
+
+    /**
+     * Singleton coroutine that observes [ShizukuSetup.serviceConnected] for the
+     * service lifetime. Translates flow emissions into discrete transitions via
+     * [BinderConnectionTracker] so duplicate connects (a frequent symptom on
+     * Samsung when the user-service is briefly killed and respawned) do not
+     * spawn a new VirtualDisplay per spurious callback.
+     *
+     * Created lazily inside [ensureShizukuSetup]; cancelled in [performCleanup]
+     * BEFORE [ShizukuSetup.release] so a queued reconnect dispatch can never
+     * race against listener teardown.
+     */
+    private var reconnectJob: Job? = null
 
     // Auto mode: dynamically adjusts resolution/fps based on conditions.
     // When true, the service starts conservatively (720p/30fps) and steps up
@@ -826,6 +843,11 @@ class MirrorForegroundService : Service() {
         try { removeAllVdTasks() } catch (e: Exception) { Log.w(TAG, "Failed to remove VD tasks", e) }
         try { pendingBrowserDisconnectJob?.cancel() } catch (_: Exception) {}
         pendingBrowserDisconnectJob = null
+        // Cancel reconnect collector BEFORE releasing ShizukuSetup so an
+        // in-flight Reconnect dispatch can never re-enter after listeners are
+        // unregistered and the binder is unbound.
+        try { reconnectJob?.cancel() } catch (_: Exception) {}
+        reconnectJob = null
         try { virtualDisplayManager?.release() } catch (e: Exception) { Log.w(TAG, "Failed to release virtual display manager", e) }
         try { shizukuSetup?.release() } catch (e: Exception) { Log.w(TAG, "Failed to release shizuku setup", e) }
         try { screenCapture?.release() } catch (e: Exception) { Log.w(TAG, "Failed to release screen capture", e) }
@@ -1714,6 +1736,20 @@ class MirrorForegroundService : Service() {
         clearSplitState()
         val previousApp = currentVdApp
 
+        if (displayId < 0) {
+            Log.w(TAG, "External browser launch refused: invalid displayId=$displayId for $url")
+            if (allowFallback) {
+                launchFullscreenWebTarget("com.castla.mirror.ui.WebBrowserActivity", displayId, url)
+                activeSession = ActiveLaunchSession(
+                    mode = SessionMode.INTERNAL_WEBVIEW,
+                    launchTarget = internalComponentName("com.castla.mirror.ui.WebBrowserActivity"),
+                    url = url,
+                    sourceAppPackage = sourceAppPackage
+                )
+            }
+            return
+        }
+
         val browser = BrowserResolver.resolve(this, url)
         if (browser != null) {
             val command = buildExternalBrowserCommand(displayId, url, browser.componentFlat, freeform = false)
@@ -1780,6 +1816,19 @@ class MirrorForegroundService : Service() {
      * Falls back to internal WebBrowserActivity if no browser is found or launch fails.
      */
     private fun launchSplitExternalBrowserTarget(displayId: Int, url: String, sourceAppPackage: String? = null, allowFallback: Boolean = true) {
+        if (displayId < 0) {
+            Log.w(TAG, "Split external browser launch refused: invalid displayId=$displayId for $url")
+            if (allowFallback) {
+                launchSplitWebTarget("com.castla.mirror.ui.WebBrowserActivity", displayId, url)
+                activeSplitSession = ActiveLaunchSession(
+                    mode = SessionMode.INTERNAL_WEBVIEW,
+                    launchTarget = internalComponentName("com.castla.mirror.ui.WebBrowserActivity"),
+                    url = url,
+                    sourceAppPackage = sourceAppPackage
+                )
+            }
+            return
+        }
         if (!ensureSplitViable("split-external-browser")) {
             Log.w(TAG, "Split external browser launch rejected; falling back to fullscreen")
             launchExternalBrowserTarget(displayId, url, sourceAppPackage, allowFallback)
@@ -2402,12 +2451,102 @@ class MirrorForegroundService : Service() {
         }
     }
 
+    /**
+     * Returns the long-lived [ShizukuSetup], creating it lazily on first
+     * browser-connect activation. Registers Shizuku binder listeners and
+     * acquires the WiFi lock exactly once for the foreground service lifetime,
+     * preventing the listener/wifi-lock pile-up that fed the prior bind cascade.
+     *
+     * Single-instance contract: subsequent calls reuse the existing instance.
+     * A reconnect-observation collector is started exactly once — guarded
+     * inside [startReconnectObserver].
+     */
+    private fun ensureShizukuSetup(): ShizukuSetup? {
+        shizukuSetup?.let {
+            Log.i(TAG, "ensureShizukuSetup: reusing existing instance")
+            return it
+        }
+        val setup = ShizukuSetup()
+        setup.init(this, bindService = true)
+        Log.i(TAG, "ensureShizukuSetup: created new instance lazily on browser-connect path")
+        shizukuSetup = setup
+        startReconnectObserver(setup)
+        return setup
+    }
+
+    /**
+     * Launch the singleton [reconnectJob]. No-op if already started.
+     *
+     * The collector classifies each [ShizukuSetup.serviceConnected] emission
+     * via [BinderConnectionTracker]:
+     *  - FirstConnect / Idempotent → no-op (initial VD creation is owned
+     *    exclusively by [trySetupVirtualDisplay]; duplicate connects from
+     *    listener pile-ups are inert).
+     *  - Disconnect → detach VDM (mark VD stale), preserve surface for the
+     *    upcoming reconnect.
+     *  - Reconnect → recreate the VD on the same encoder surface and restore
+     *    the previously-launched app via [restoreCurrentVdContent].
+     */
+    private fun startReconnectObserver(setup: ShizukuSetup) {
+        if (reconnectJob != null) return
+        reconnectJob = serviceScope.launch {
+            val tracker = BinderConnectionTracker()
+            setup.serviceConnected.collect { connected ->
+                val transition = if (connected) tracker.onConnected() else tracker.onDisconnected()
+                Log.i(TAG, "Shizuku connection transition=$transition connected=$connected")
+                when (transition) {
+                    BinderConnectionTracker.Transition.FirstConnect,
+                    BinderConnectionTracker.Transition.Idempotent -> { /* trySetupVirtualDisplay owns first-connect; idempotent ignored */ }
+                    BinderConnectionTracker.Transition.Disconnect -> handleShizukuDisconnect()
+                    BinderConnectionTracker.Transition.Reconnect -> handleShizukuReconnect(setup)
+                }
+            }
+        }
+    }
+
+    private fun handleShizukuDisconnect() {
+        val vdm = virtualDisplayManager ?: return
+        vdm.attachPrivilegedService(null)
+    }
+
+    private fun handleShizukuReconnect(setup: ShizukuSetup) {
+        if (!browserConnected) {
+            Log.w(TAG, "Ignoring stale Shizuku reconnect after browser disconnect")
+            return
+        }
+        val vdm = virtualDisplayManager ?: return
+        val surf = currentEncoderSurface ?: return
+        if (currentWidth <= 0 || currentHeight <= 0) {
+            Log.w(TAG, "Reconnect skipped: invalid dims ${currentWidth}x${currentHeight}")
+            return
+        }
+        val svc = setup.privilegedService ?: return
+        vdm.attachPrivilegedService(svc)
+        vdm.createVirtualDisplay(currentWidth, currentHeight, computeVirtualDisplayDpi(currentWidth, currentHeight), surf)
+        if (vdm.hasVirtualDisplay()) {
+            touchInjector?.setVirtualDisplayInjector { action, x, y, pointerId ->
+                vdm.injectInput(action, x, y, pointerId)
+            }
+            restoreCurrentVdContent()
+        }
+    }
+
     private fun trySetupVirtualDisplay(
         width: Int,
         height: Int,
         surface: android.view.Surface,
         onResult: (Boolean) -> Unit
     ) {
+        // Atomic guard: rebuildPipeline races (e.g. concurrent codec-change +
+        // browser-reconnect on a closed-flip → wifi-drop recovery) used to
+        // launch trySetupVirtualDisplay twice, each creating its own VDM and
+        // VD. The shizukuSetupInProgress guard in rebuildPipeline catches most
+        // cases but not all — gate at the entry as well.
+        if (shizukuSetupInProgress) {
+            Log.i(TAG, "trySetupVirtualDisplay skipped: setup already in progress")
+            onResult(false)
+            return
+        }
         shizukuSetupInProgress = true
         var resultDelivered = false
         val safeResult = { success: Boolean ->
@@ -2415,125 +2554,106 @@ class MirrorForegroundService : Service() {
                 resultDelivered = true
                 shizukuSetupInProgress = false
                 if (!success) {
-                    releaseShizukuSession("virtual_display_setup_failed")
+                    tearDownVdSession("virtual_display_setup_failed")
                 }
                 onResult(success)
             }
         }
 
-        try {
-            releaseShizukuSession("before_virtual_display_setup")
-            val setup = ShizukuSetup()
-            setup.init(this, bindService = false)
+        val setup = ensureShizukuSetup() ?: run {
+            Log.w(TAG, "trySetupVirtualDisplay: ensureShizukuSetup returned null")
+            safeResult(false)
+            return
+        }
+        if (!setup.isAvailable() || !setup.hasPermission()) {
+            Log.i(TAG, "Shizuku not available/permitted")
+            safeResult(false)
+            return
+        }
 
-            if (!setup.isAvailable() || !setup.hasPermission()) {
-                Log.i(TAG, "Shizuku not available/permitted")
-                setup.release()
-                safeResult(false)
-                return
-            }
+        // bindPrivilegedService is idempotent; safe even if already bound.
+        setup.bindPrivilegedService()
 
-            shizukuSetup = setup
-            val vdm = VirtualDisplayManager()
-            virtualDisplayManager = vdm
+        serviceScope.launch {
+            val connected = withTimeoutOrNull(BIND_WAIT_BUDGET_MS) {
+                setup.serviceConnected.first { it }
+            } != null
 
-            vdm.reconnectListener = reconnect@ {
-                if (!browserConnected) {
-                    Log.w(TAG, "Ignoring stale Shizuku reconnect after browser disconnect")
-                    return@reconnect
-                }
-                val surf = currentEncoderSurface
-                if (surf != null) {
-                    vdm.createVirtualDisplay(currentWidth, currentHeight, 160, surf)
-                    if (vdm.hasVirtualDisplay()) {
-                        // Refresh the binder so audio/text/input paths use the new connection
-                        setup.attachPrivilegedService(vdm.getPrivilegedService())
-                        touchInjector?.setVirtualDisplayInjector { action, x, y, pointerId ->
-                            vdm.injectInput(action, x, y, pointerId)
+            if (!connected) {
+                shizukuBindRetryCount++
+                FileLogger.w(TAG, "trySetupVirtualDisplay: serviceConnected timeout (attempt $shizukuBindRetryCount/$SHIZUKU_MAX_RETRIES)")
+                if (shizukuBindRetryCount <= SHIZUKU_MAX_RETRIES) {
+                    Log.w(TAG, "Shizuku binding timed out (attempt $shizukuBindRetryCount/$SHIZUKU_MAX_RETRIES) — retrying")
+                    shizukuSetupInProgress = false
+                    tearDownVdSession("binding_timeout")
+                    kotlinx.coroutines.delay(2_000)
+                    if (browserConnected) {
+                        val surf = currentEncoderSurface
+                        if (surf != null) {
+                            Log.i(TAG, "Retrying Shizuku setup after timeout (attempt ${shizukuBindRetryCount + 1})")
+                            trySetupVirtualDisplay(currentWidth, currentHeight, surf, onResult)
+                            return@launch
                         }
-                        restoreCurrentVdContent()
                     }
-                }
-            }
-
-            vdm.bindShizukuService { bound ->
-                try {
-                    if (!browserConnected) {
-                        Log.w(TAG, "Ignoring stale virtual display bind callback after browser disconnect")
-                        safeResult(false)
-                        return@bindShizukuService
-                    }
-                    if (bound) {
-                        shizukuBindRetryCount = 0
-                        // Enable freeform windowing support for split mode
-                        try {
-                            vdm.getPrivilegedService()?.let { svc ->
-                                svc.execCommand("settings put global enable_freeform_support 1")
-                                svc.execCommand("settings put global force_resizable_activities 1")
-                                Log.i(TAG, "Enabled freeform windowing support")
-                            }
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Failed to enable freeform support (non-fatal)", e)
-                        }
-                        // Use latest dimensions/surface in case viewport changed during async bind
-                        val actualWidth = if (currentWidth > 0) currentWidth else width
-                        val actualHeight = if (currentHeight > 0) currentHeight else height
-                        val actualSurface = currentEncoderSurface ?: surface
-                        val actualDpi = computeVirtualDisplayDpi(actualWidth, actualHeight)
-                        vdm.createVirtualDisplay(actualWidth, actualHeight, actualDpi, actualSurface)
-                        if (vdm.hasVirtualDisplay()) {
-                            setup.attachPrivilegedService(vdm.getPrivilegedService())
-                            touchInjector?.setVirtualDisplayInjector { action, x, y, pointerId ->
-                                vdm.injectInput(action, x, y, pointerId)
-                            }
-                            // Harden Shizuku (fortify + install watchdog if needed) for WiFi-off survival
-                            serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                                val ok = setup.ensureShizukuHardened()
-                                Log.i(TAG, "ensureShizukuHardened (service): $ok")
-                            }
-                            safeResult(true)
-                        } else {
-                            safeResult(false)
-                        }
-                    } else {
-                        safeResult(false)
-                    }
-                } catch (e: Exception) {
+                    // Browser/surface gone before we could retry — final failure via
+                    // single-delivery guard, otherwise the caller's MediaProjection
+                    // fallback could race with a stale resultDelivered=false state.
+                    safeResult(false)
+                } else {
+                    Log.e(TAG, "Shizuku binding failed after $SHIZUKU_MAX_RETRIES retries — Shizuku server may need restart")
                     safeResult(false)
                 }
+                return@launch
             }
 
-            // Timeout: if binding callback never fires (e.g. service process killed by Shizuku),
-            // reset flags and retry up to SHIZUKU_MAX_RETRIES times.
-            mainHandler.postDelayed({
-                if (!resultDelivered) {
-                    shizukuBindRetryCount++
-                    if (shizukuBindRetryCount <= SHIZUKU_MAX_RETRIES) {
-                        Log.w(TAG, "Shizuku binding timed out (attempt $shizukuBindRetryCount/$SHIZUKU_MAX_RETRIES) — retrying")
-                        resultDelivered = true
-                        shizukuSetupInProgress = false
-                        releaseShizukuSession("binding_timeout")
-                        mainHandler.postDelayed({
-                            if (browserConnected) {
-                                val surf = currentEncoderSurface
-                                if (surf != null) {
-                                    Log.i(TAG, "Retrying Shizuku setup after timeout (attempt ${shizukuBindRetryCount + 1})")
-                                    trySetupVirtualDisplay(currentWidth, currentHeight, surf, onResult)
-                                } else {
-                                    onResult(false)
-                                }
-                            } else {
-                                onResult(false)
-                            }
-                        }, 2_000)
-                    } else {
-                        Log.e(TAG, "Shizuku binding failed after $SHIZUKU_MAX_RETRIES retries — Shizuku server may need restart")
-                        safeResult(false)
-                    }
+            shizukuBindRetryCount = 0
+
+            // Late-event guard: browser may have disconnected while we awaited.
+            if (!browserConnected) {
+                Log.w(TAG, "trySetupVirtualDisplay: browser disconnected during bind wait — abort")
+                safeResult(false)
+                return@launch
+            }
+
+            val svc = setup.privilegedService
+            if (svc == null) {
+                Log.w(TAG, "trySetupVirtualDisplay: serviceConnected=true but privilegedService null")
+                safeResult(false)
+                return@launch
+            }
+
+            // Enable freeform windowing support for split mode
+            try {
+                svc.execCommand("settings put global enable_freeform_support 1")
+                svc.execCommand("settings put global force_resizable_activities 1")
+                Log.i(TAG, "Enabled freeform windowing support")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to enable freeform support (non-fatal)", e)
+            }
+
+            val vdm = VirtualDisplayManager().also { virtualDisplayManager = it }
+            vdm.attachPrivilegedService(svc)
+
+            // Use latest dimensions/surface in case viewport changed during async wait
+            val actualWidth = if (currentWidth > 0) currentWidth else width
+            val actualHeight = if (currentHeight > 0) currentHeight else height
+            val actualSurface = currentEncoderSurface ?: surface
+            val actualDpi = computeVirtualDisplayDpi(actualWidth, actualHeight)
+            vdm.createVirtualDisplay(actualWidth, actualHeight, actualDpi, actualSurface)
+
+            if (vdm.hasVirtualDisplay()) {
+                touchInjector?.setVirtualDisplayInjector { action, x, y, pointerId ->
+                    vdm.injectInput(action, x, y, pointerId)
                 }
-            }, 8_000)
-        } catch (e: Exception) {
-            safeResult(false)
+                // Harden Shizuku (fortify + install watchdog if needed) for WiFi-off survival
+                serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val ok = setup.ensureShizukuHardened()
+                    Log.i(TAG, "ensureShizukuHardened (service): $ok")
+                }
+                safeResult(true)
+            } else {
+                safeResult(false)
+            }
         }
     }
 
@@ -2639,13 +2759,17 @@ class MirrorForegroundService : Service() {
         }
     }
 
-    private fun releaseShizukuSession(reason: String) {
-        Log.i(TAG, "Releasing Shizuku session: $reason")
+    /**
+     * Tear down the per-session VD/encoder wiring. Does NOT release
+     * [shizukuSetup] or its listeners — that lives for the foreground service
+     * lifetime so the singleton bind contract holds across browser
+     * disconnect/reconnect and pipeline rebuilds.
+     */
+    private fun tearDownVdSession(reason: String) {
+        Log.i(TAG, "Tearing down VD session: $reason")
         try { touchInjector?.setVirtualDisplayInjector(null) } catch (_: Exception) {}
         try { virtualDisplayManager?.release() } catch (e: Exception) { Log.w(TAG, "Failed to release virtual display manager", e) }
-        try { shizukuSetup?.release() } catch (e: Exception) { Log.w(TAG, "Failed to release shizuku setup", e) }
         virtualDisplayManager = null
-        shizukuSetup = null
     }
 
     private fun ensureAudioCaptureState(codecOverride: String? = null) {
@@ -2751,7 +2875,7 @@ class MirrorForegroundService : Service() {
             releaseSecondaryPipeline(clearState = false)
         }
         try { removeAllVdTasks() } catch (e: Exception) { Log.w(TAG, "Failed to remove VD tasks on disconnect", e) }
-        releaseShizukuSession("browser_disconnected")
+        tearDownVdSession("browser_disconnected")
         
         screenCapture?.stopCapture()
         videoEncoder?.release()

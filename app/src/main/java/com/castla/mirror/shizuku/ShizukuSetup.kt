@@ -607,12 +607,6 @@ class ShizukuSetup {
         mgr.createNotificationChannel(channel)
     }
 
-    fun attachPrivilegedService(service: IPrivilegedService?) {
-        privilegedService = service
-        _serviceConnected.value = service != null
-        bindingInProgress = false
-    }
-
     fun requestPermission() {
         if (Shizuku.isPreV11()) {
             Log.w(TAG, "Shizuku pre-v11 not supported")

@@ -1,26 +1,23 @@
 package com.castla.mirror.capture
 
-import android.content.ComponentName
-import android.content.ServiceConnection
 import android.hardware.display.VirtualDisplay
-import android.os.Handler
-import android.os.IBinder
-import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import com.castla.mirror.diagnostics.DiagnosticEvent
 import com.castla.mirror.diagnostics.MirrorDiagnostics
 import com.castla.mirror.shizuku.IPrivilegedService
-import com.castla.mirror.shizuku.PrivilegedService
-import com.castla.mirror.shizuku.ShizukuSetup
-import rikka.shizuku.Shizuku
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 /**
- * Creates a virtual display using Shizuku for independent phone + Tesla operation.
- * When a virtual display is active, the phone screen operates independently while
- * Tesla shows content on the virtual display.
+ * Owns the per-session virtual display lifecycle and exposes VD-scoped privileged
+ * operations (input injection, app launch, surface attachment).
+ *
+ * Binder ownership: this class no longer binds the Shizuku user-service. The
+ * `IPrivilegedService` reference is passed in via [attachPrivilegedService] by
+ * the foreground service, which keeps a single long-lived [com.castla.mirror.shizuku.ShizukuSetup]
+ * as the sole bind owner. Previously this class held its own ServiceConnection,
+ * which produced two concurrent binds per session and a cascade of orphan VDs
+ * when duplicate `onServiceConnected` callbacks were misclassified as binder
+ * deaths.
  */
 class VirtualDisplayManager {
 
@@ -32,119 +29,29 @@ class VirtualDisplayManager {
     private var privilegedService: IPrivilegedService? = null
     @Volatile private var displayId: Int = -1
     @Volatile private var isBound = false
-    private var bindingInProgress = false
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var serviceConnection: ServiceConnection? = null
-    private var userServiceArgs: Shizuku.UserServiceArgs? = null
 
-    private fun runOnMainSync(block: () -> Unit) {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            block()
-            return
+    /**
+     * Mirror the latest [IPrivilegedService] reference owned by `ShizukuSetup`.
+     * Called on first connect and on every reconnect after a binder death.
+     * Passing `null` invalidates the local VD state — the caller must follow up
+     * with [createVirtualDisplay] before issuing any VD-scoped operations again.
+     */
+    fun attachPrivilegedService(svc: IPrivilegedService?) {
+        privilegedService = svc
+        isBound = svc != null
+        if (svc == null) {
+            virtualDisplay = null
+            displayId = -1
         }
-        val latch = CountDownLatch(1)
-        var error: Throwable? = null
-        mainHandler.post {
-            try {
-                block()
-            } catch (t: Throwable) {
-                error = t
-            } finally {
-                latch.countDown()
-            }
-        }
-        latch.await(2, TimeUnit.SECONDS)
-        error?.let { throw it }
     }
-
-    /** Called when Shizuku service reconnects after a death — caller should recreate VD + launch home */
-    var reconnectListener: (() -> Unit)? = null
 
     /** Expose the privileged service for IME checks (avoids separate binder connection) */
     fun getPrivilegedService(): IPrivilegedService? = privilegedService
 
     /**
-     * Bind to the Shizuku privileged service.
-     * Must be called before createVirtualDisplay when using Shizuku mode.
-     * Returns true if binding was initiated.
-     */
-    fun bindShizukuService(callback: (Boolean) -> Unit): Boolean {
-        if (isBound && privilegedService != null) {
-            callback(true)
-            return true
-        }
-        if (bindingInProgress) {
-            Log.d(TAG, "bindShizukuService skipped: bind already in progress")
-            return true
-        }
-
-        return try {
-            bindingInProgress = true
-            val args = Shizuku.UserServiceArgs(
-                ComponentName(
-                    com.castla.mirror.BuildConfig.APPLICATION_ID,
-                    PrivilegedService::class.java.name
-                )
-            )
-                .daemon(false)
-                .processNameSuffix("privileged")
-                .debuggable(true)
-                .version(ShizukuSetup.USER_SERVICE_VERSION)
-            userServiceArgs = args
-
-            var callbackFired = false
-            val connection = object : ServiceConnection {
-                override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-                    privilegedService = IPrivilegedService.Stub.asInterface(binder)
-                    bindingInProgress = false
-                    
-                    try {
-                        privilegedService?.registerDeathToken(android.os.Binder())
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to register death token", e)
-                    }
-
-                    isBound = true
-                    Log.i(TAG, "Shizuku privileged service connected")
-                    MirrorDiagnostics.log(DiagnosticEvent.SHIZUKU_BINDER_READY, "via VirtualDisplayManager")
-                    if (!callbackFired) {
-                        callbackFired = true
-                        callback(true)
-                    } else {
-                        // Reconnect after service death — any previous displayId is now stale because
-                        // PrivilegedService keeps the VirtualDisplay map in-process.
-                        virtualDisplay = null
-                        displayId = -1
-                        Log.i(TAG, "Shizuku service reconnected (was dead), notifying listener")
-                        reconnectListener?.invoke()
-                    }
-                }
-
-                override fun onServiceDisconnected(name: ComponentName?) {
-                    privilegedService = null
-                    isBound = false
-                    bindingInProgress = false
-                    displayId = -1
-                    Log.i(TAG, "Shizuku privileged service disconnected")
-                    MirrorDiagnostics.log(DiagnosticEvent.SHIZUKU_BINDER_DEAD, "via VirtualDisplayManager")
-                }
-            }
-            serviceConnection = connection
-
-            runOnMainSync { Shizuku.bindUserService(args, connection) }
-            true
-        } catch (e: Exception) {
-            bindingInProgress = false
-            Log.w(TAG, "Failed to bind Shizuku service", e)
-            callback(false)
-            false
-        }
-    }
-
-    /**
-     * Create a virtual display via Shizuku's elevated privileges.
-     * If Shizuku is not available, returns null — caller should fall back
-     * to MediaProjection's built-in VirtualDisplay.
+     * Create a virtual display via Shizuku's elevated privileges. Returns null
+     * because the underlying privileged service tracks the [VirtualDisplay] in
+     * its own process; locally we only retain the assigned [displayId].
      */
     fun createVirtualDisplay(
         width: Int,
@@ -189,12 +96,12 @@ class VirtualDisplayManager {
             null
         }
     }
-    
+
     /** Creates an additional virtual display for dual-screen scenarios */
     fun createSecondaryVirtualDisplay(width: Int, height: Int, dpi: Int, surface: Surface): Int {
         val service = privilegedService
         if (service == null) return -1
-        
+
         return try {
             val id = service.createVirtualDisplay(width, height, dpi, "Castla_Sec")
             if (id >= 0) {
@@ -205,13 +112,13 @@ class VirtualDisplayManager {
             -1
         }
     }
-    
+
     fun releaseSecondaryVirtualDisplay(id: Int) {
         try {
             privilegedService?.releaseVirtualDisplay(id)
         } catch (e: Exception) {}
     }
-    
+
     fun launchAppOnSpecificDisplay(targetDisplayId: Int, packageName: String) {
         try {
             privilegedService?.launchAppOnDisplay(targetDisplayId, packageName)
@@ -264,7 +171,7 @@ class VirtualDisplayManager {
         }
     }
 
-    /** Returns true if the Shizuku service is bound (even if no VD is active). */
+    /** Returns true if the privileged service mirror is set. */
     fun isBound(): Boolean = isBound && privilegedService != null
 
     /** Display ID of the Shizuku-created virtual display, or -1. */
@@ -325,11 +232,11 @@ class VirtualDisplayManager {
             Log.i(TAG, "Launched $packageName on virtual display $id")
             true
         } catch (e: SecurityException) {
-            Log.e(TAG, "Display $id is stale (SecurityException), invalidating", e)
+            Log.e(TAG, "Failed to launch $packageName on display $id (display not found?)", e)
             displayId = -1
             false
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch $packageName on virtual display $id", e)
+            Log.e(TAG, "Failed to launch $packageName on display $id", e)
             false
         }
     }
@@ -343,17 +250,17 @@ class VirtualDisplayManager {
             Log.i(TAG, "Launched $packageName with extra on virtual display $id")
             true
         } catch (e: SecurityException) {
-            Log.e(TAG, "Display $id is stale (SecurityException), invalidating", e)
+            Log.e(TAG, "Failed to launch $packageName with extra on display $id (display not found?)", e)
             displayId = -1
             false
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch $packageName on virtual display $id", e)
+            Log.e(TAG, "Failed to launch $packageName on display $id", e)
             false
         }
     }
 
     /**
-     * Release just the virtual display, keeping the Shizuku service bound.
+     * Release just the virtual display, keeping the privileged service mirror.
      * Use this when rebuilding the pipeline with new dimensions.
      */
     fun releaseVirtualDisplay() {
@@ -371,6 +278,11 @@ class VirtualDisplayManager {
         displayId = -1
     }
 
+    /**
+     * Local-state release. Does NOT unbind the Shizuku user service — that is
+     * owned by `ShizukuSetup` for the foreground service lifetime. Releases the
+     * privileged-service-side VD first when one is held.
+     */
     fun release() {
         val releasedId = displayId
         if (releasedId >= 0) {
@@ -381,21 +293,8 @@ class VirtualDisplayManager {
             }
             MirrorDiagnostics.log(DiagnosticEvent.VD_STOPPED, "id=$releasedId (full release)")
         }
-        try {
-            privilegedService?.destroy()
-        } catch (_: Exception) {}
-
-        val args = userServiceArgs
-        val conn = serviceConnection
-        if (args != null && conn != null) {
-            try { runOnMainSync { Shizuku.unbindUserService(args, conn, true) } } catch (_: Exception) {}
-        }
-
         privilegedService = null
         isBound = false
-        bindingInProgress = false
-        serviceConnection = null
-        userServiceArgs = null
         virtualDisplay?.release()
         virtualDisplay = null
         displayId = -1
