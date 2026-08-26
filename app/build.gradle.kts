@@ -113,6 +113,20 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    packaging {
+        resources {
+            // bcprov/bcpkix ship signed META-INF entries that collide with
+            // each other (and sometimes other deps) during APK packaging.
+            excludes += setOf(
+                "META-INF/*.RSA",
+                "META-INF/*.SF",
+                "META-INF/*.DSA",
+                "META-INF/BCKEY.*",
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+            )
+        }
+    }
 }
 
 androidComponents {
@@ -138,6 +152,12 @@ dependencies {
     // NanoHTTPD (HTTP + WebSocket server)
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("org.nanohttpd:nanohttpd-websocket:2.3.1")
+
+    // Bouncy Castle — used only to mint the local self-signed TLS certificate
+    // for MirrorServer (Android's built-in security provider doesn't expose
+    // APIs for building an X.509 cert with custom SAN entries).
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
 
     // Shizuku
     implementation("dev.rikka.shizuku:api:13.1.5")

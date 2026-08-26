@@ -11,6 +11,13 @@
 # ZXing QR code
 -keep class com.google.zxing.** { *; }
 
+# Bouncy Castle — used by SelfSignedTls.kt to mint MirrorServer's TLS cert.
+# The provider is looked up by name (Security.addProvider / JCA algorithm
+# lookups) and does other reflection internally, so it needs to survive
+# shrinking/obfuscation intact.
+-keep class org.bouncycastle.** { *; }
+-dontwarn org.bouncycastle.**
+
 # Shizuku SDK
 -keep class rikka.shizuku.** { *; }
 
