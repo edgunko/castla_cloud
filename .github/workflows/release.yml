@@ -131,23 +131,25 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Decode keystore
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-        run: echo "$KEYSTORE_BASE64" | base64 --decode > ${{ github.workspace }}/release.keystore
-
-      - name: Create keystore.properties
-        run: |
-          cat > keystore.properties <<EOF
-          storeFile=${{ github.workspace }}/release.keystore
-          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
-          keyAlias=${{ secrets.KEY_ALIAS }}
-          keyPassword=${{ secrets.KEY_PASSWORD }}
-          EOF
-          sed -i 's/^[[:space:]]*//' keystore.properties
-
-      - name: Build signed Release APK
+      - name: Build Unsigned Release APK
         run: ./gradlew assembleRelease
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          # Находим сгенерированный APK (неподписанный)
+          APK_PATH=$(find app/build/outputs/apk/release/ -name "*.apk" | head -n 1)
+          APK_NAME="castla-${VERSION}.apk"
+          mv "$APK_PATH" "app/build/outputs/apk/release/${APK_NAME}"
+
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --generate-notes \
+            --latest \
+            "app/build/outputs/apk/release/${APK_NAME}"
 
       - name: Create GitHub Release
         env:
