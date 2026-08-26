@@ -150,19 +150,3 @@ jobs:
             --generate-notes \
             --latest \
             "app/build/outputs/apk/release/${APK_NAME}"
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.tag }}"
-          APK_PATH="app/build/outputs/apk/release/app-release.apk"
-          APK_NAME="castla-${VERSION}.apk"
-          mv "$APK_PATH" "app/build/outputs/apk/release/${APK_NAME}"
-
-          gh release create "${TAG}" \
-            --title "${TAG}" \
-            --generate-notes \
-            --latest \
-            "app/build/outputs/apk/release/${APK_NAME}"
