@@ -650,12 +650,11 @@ class MainActivity : AppCompatActivity() {
             else -> "0.0.0.0"
         }
 
-        if (ip != "0.0.0.0") {
-            val sslipDomain = ip.replace('.', '-') + ".sslip.io"
-            serverUrl = "http://${sslipDomain}:${MirrorServer.DEFAULT_PORT}"
-        } else {
-            serverUrl = "http://${ip}:${MirrorServer.DEFAULT_PORT}"
-        }
+        // MirrorServer.enableTls() mints a self-signed cert covering the
+        // device's own local IPv4 addresses, so we can point straight at the
+        // raw IP over https:// — no DNS round-trip (e.g. sslip.io) needed,
+        // and it keeps working even with no internet reachable from the car.
+        serverUrl = "https://${ip}:${MirrorServer.DEFAULT_PORT}"
     }
 
     private fun getCellularIpv4Address(): String? {
