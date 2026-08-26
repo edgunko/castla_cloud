@@ -149,4 +149,4 @@ jobs:
             --title "${TAG}" \
             --generate-notes \
             --latest \
-            "app/build/outputs/apk/release/${APK_NAME}"
+            "${APK_NAME}"
