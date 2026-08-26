@@ -127,6 +127,51 @@ class MirrorServer(private val context: Context) : NanoWSD(DEFAULT_PORT) {
 
     fun isBrowserConnected(): Boolean = isBrowserConnected
 
+    /**
+     * Switches this server into TLS (https:// / wss://) mode using a
+     * self-signed certificate covering every local IPv4 address currently
+     * assigned to the device. Must be called before [start]. Returns true if
+     * TLS was enabled; on any failure it logs and returns false so the
+     * caller can fall back to plain HTTP rather than crash the server.
+     */
+    fun enableTls(): Boolean {
+        return try {
+            val hosts = collectLocalIpv4Addresses()
+            if (hosts.isEmpty()) {
+                Log.w(TAG, "No local IPv4 address found — cannot mint a TLS cert, staying on plain HTTP")
+                return false
+            }
+            val factory = SelfSignedTls.getServerSocketFactory(context, hosts)
+            makeSecure(factory, null)
+            Log.i(TAG, "TLS enabled — serving https/wss, cert covers $hosts")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to enable TLS — falling back to plain HTTP", e)
+            false
+        }
+    }
+
+    private fun collectLocalIpv4Addresses(): List<String> {
+        val ips = mutableListOf<String>()
+        try {
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val iface = interfaces.nextElement()
+                if (iface.isLoopback || !iface.isUp) continue
+                val addrs = iface.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    if (!addr.isLoopbackAddress && addr.address.size == 4) {
+                        addr.hostAddress?.let { ips.add(it) }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to enumerate local IPv4 addresses", e)
+        }
+        return ips
+    }
+
 
     fun onCloseSplitRequest() {
         onCloseSplitListener?.invoke()
