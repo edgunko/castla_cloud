@@ -1157,8 +1157,9 @@ class MirrorForegroundService : Service() {
                     }
                 }
 
+                val tlsEnabled = server.enableTls()
                 server.start(0)
-                Log.i(TAG, "Server started on port ${MirrorServer.DEFAULT_PORT} — waiting for browser")
+                Log.i(TAG, "Server started on port ${MirrorServer.DEFAULT_PORT} (tls=$tlsEnabled) — waiting for browser")
             }
 
             Log.i(TAG, "Pipeline initialized (idle): ${width}x${height}, audio=$audioEnabled")
