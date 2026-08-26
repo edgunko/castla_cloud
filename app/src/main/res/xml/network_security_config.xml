@@ -1,9 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
     <!--
-        Cleartext (HTTP) is required because the mirroring server runs locally on the phone
-        and the Tesla browser connects to it over the LAN. TLS is not practical for a local
-        ephemeral server. Access control is enforced via per-session random token instead.
+        MirrorServer now serves TLS (see SelfSignedTls.kt / MirrorServer.enableTls()),
+        using a self-signed certificate covering the phone's local IPv4 addresses —
+        this was added because Tesla's browser started blocking/upgrading plain
+        http(s)/ws(s) connections to local addresses around mid-2026.
+
+        cleartextTrafficPermitted stays true here regardless: it governs the app's
+        *outbound* requests (e.g. WebBrowserActivity loading arbitrary sites), not
+        what MirrorServer serves inbound, so it's unrelated to the TLS change above.
     -->
     <base-config cleartextTrafficPermitted="true" />
 </network-security-config>
