@@ -132,7 +132,7 @@ jobs:
             ${{ runner.os }}-gradle-
 
       - name: Build Unsigned Release APK
-        run: ./gradlew assembleRelease
+        run: ./gradlew assembleDebug
 
       - name: Create GitHub Release
         env:
